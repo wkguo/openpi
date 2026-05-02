@@ -77,7 +77,7 @@ class Policy(BasePolicy):
         return self._output_transform(outputs)
     
     @override
-    def get_prefix_rep(self, obs: dict):
+    def get_prefix_rep(self, obs: dict, *, last_rep: bool = False):
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         inputs = jax.tree.map(lambda x: jnp.asarray(x), inputs)
@@ -94,7 +94,11 @@ class Policy(BasePolicy):
                     inputs[key] = jax.tree.map(lambda x: _add_batch_dim(x), inputs[key])
         else:
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-        return self._get_prefix_rep(_model.Observation.from_dict(inputs))
+        prefix_rep, kv_cache = self._get_prefix_rep(_model.Observation.from_dict(inputs))
+        if last_rep:
+            prefix_rep = prefix_rep[:, -1, :]
+            kv_cache = None
+        return prefix_rep, kv_cache
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -113,8 +117,8 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step = 0
 
     @override
-    def infer(self, obs: dict) -> dict:  # type: ignore[misc]
-        results = self._policy.infer(obs)
+    def infer(self, obs: dict, noise: jnp.ndarray | None = None) -> dict:  # type: ignore[misc]
+        results = self._policy.infer(obs, noise)
 
         data = {"inputs": obs, "outputs": results}
         data = flax.traverse_util.flatten_dict(data, sep="/")
@@ -124,3 +128,6 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+    def get_prefix_rep(self, obs: dict, *, last_rep: bool = False):
+        return self._policy.get_prefix_rep(obs, last_rep=last_rep)

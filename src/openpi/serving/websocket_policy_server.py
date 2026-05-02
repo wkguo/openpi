@@ -57,7 +57,7 @@ class WebsocketPolicyServer:
                     noise = obs.pop("noise", None)
                     result = self._policy.infer(obs, noise)
                 elif method == "get_prefix_rep":
-                    result = self._policy.get_prefix_rep(obs)
+                    result = self._policy.get_prefix_rep(obs, last_rep=message.get("last_rep", False))
                 else:
                     raise ValueError(f"Unknown method: {method}")
                 # convert result to numpy array
