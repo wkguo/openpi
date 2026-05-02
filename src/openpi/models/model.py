@@ -28,6 +28,7 @@ class ModelType(enum.Enum):
 
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
+    PI05 = "pi05"
 
 
 # The model always expects these images
@@ -267,7 +268,7 @@ class BaseModel(nnx.Module, abc.ABC):
     ) -> at.Float[at.Array, "*b ah"]: ...
 
     @abc.abstractmethod
-    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions: ...
+    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
 
 
 def restore_params(

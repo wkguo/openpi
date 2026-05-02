@@ -1034,9 +1034,9 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
-    # RoboArena & PolaRiS configs.
-    *roboarena_config.get_roboarena_configs(),
-    *polaris_config.get_polaris_configs(),
+    # # RoboArena & PolaRiS configs.
+    # *roboarena_config.get_roboarena_configs(),
+    # *polaris_config.get_polaris_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
