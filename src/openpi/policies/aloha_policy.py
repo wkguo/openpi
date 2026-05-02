@@ -31,6 +31,9 @@ class AlohaInputs(transforms.DataTransformFn):
     - actions: [action_horizon, 14]
     """
 
+    # The action dimension of the model. Will be used to pad state and actions.
+    action_dim: int
+
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
@@ -41,6 +44,9 @@ class AlohaInputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         data = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
+
+        # Get the state. We are padding from 14 to the model action dim.
+        state = transforms.pad_to_dim(data["state"], self.action_dim)
 
         in_images = data["images"]
         if set(in_images) - set(self.EXPECTED_CAMERAS):
@@ -72,14 +78,14 @@ class AlohaInputs(transforms.DataTransformFn):
         inputs = {
             "image": images,
             "image_mask": image_masks,
-            "state": data["state"],
+            "state": state,
         }
 
         # Actions are only available during training.
         if "actions" in data:
             actions = np.asarray(data["actions"])
             actions = _encode_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
-            inputs["actions"] = actions
+            inputs["actions"] = transforms.pad_to_dim(actions, self.action_dim)
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
@@ -131,19 +137,17 @@ def _gripper_to_angular(value):
     # The constants are taken from the Interbotix code.
     value = linear_to_radian(value, arm_length=0.036, horn_radius=0.022)
 
-    # pi0 gripper data is normalized (0, 1) between encoder counts (2405, 3110).
-    # There are 4096 total encoder counts and aloha uses a zero of 2048.
-    # Converting this to radians means that the normalized inputs are between (0.5476, 1.6296)
-    return _normalize(value, min_val=0.5476, max_val=1.6296)
+    # Normalize to [0, 1].
+    # The values 0.4 and 1.5 were measured on an actual Trossen robot.
+    return _normalize(value, min_val=0.4, max_val=1.5)
 
 
 def _gripper_from_angular(value):
     # Convert from the gripper position used by pi0 to the gripper position that is used by Aloha.
     # Note that the units are still angular but the range is different.
 
-    # We do not scale the output since the trossen model predictions are already in radians.
-    # See the comment in _gripper_to_angular for a derivation of the constant
-    value = value + 0.5476
+    # The values 0.4 and 1.5 were measured on an actual Trossen robot.
+    value = _unnormalize(value, min_val=0.4, max_val=1.5)
 
     # These values are coming from the Aloha code:
     # PUPPET_GRIPPER_JOINT_OPEN, PUPPET_GRIPPER_JOINT_CLOSE
@@ -153,11 +157,11 @@ def _gripper_from_angular(value):
 def _gripper_from_angular_inv(value):
     # Directly inverts the gripper_from_angular function.
     value = _unnormalize(value, min_val=-0.6213, max_val=1.4910)
-    return value - 0.5476
+    return _normalize(value, min_val=0.4, max_val=1.5)
 
 
 def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
-    # state is [left_arm_joint_angles, left_arm_gripper, right_arm_joint_angles, right_arm_gripper]
+    # state is [left_arm_joint_angles, right_arm_joint_angles, left_arm_gripper, right_arm_gripper]
     # dim sizes: [6, 1, 6, 1]
     state = np.asarray(data["state"])
     state = _decode_state(state, adapt_to_pi=adapt_to_pi)
