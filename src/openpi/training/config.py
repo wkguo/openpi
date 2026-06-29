@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.pine_foundry_policy as pine_foundry_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -400,6 +401,60 @@ class LeRobotFR3DataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotPineFoundryDataConfig(DataConfigFactory):
+    """Pine "foundry" Industrial_Arm: 3 cameras (view1/hand/view2), 13D state
+    (pose+force/torque), 7D absolute EEF pose+gripper action.
+
+    Mirrors LeRobotFR3DataConfig but uses all three cameras via
+    ``pine_foundry_policy``. ``extra_delta_transform`` matches the pine FR3 recipe
+    (delta on the first 6 action dims, gripper absolute)."""
+
+    extra_delta_transform: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.view1",
+                        "observation/wrist_image": "observation.images.hand",
+                        "observation/extra_view_image": "observation.images.view2",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                pine_foundry_policy.PineFoundryInputs(
+                    action_dim=model_config.action_dim, model_type=model_config.model_type
+                )
+            ],
+            outputs=[pine_foundry_policy.PineFoundryOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -507,6 +562,46 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class AWRConfig:
+    """AWR/AWAC continuous advantage weighting for offline-RL policy training."""
+
+    enabled: bool = False
+    beta: float = 0.7  # temperature; larger -> closer to uniform (-> RECAP)
+    w_max: float = 20.0  # per-sample weight clip
+
+
+@dataclasses.dataclass(frozen=True)
+class SFTAuxConfig:
+    """SFT flow-BC auxiliary anchor."""
+
+    weight: float = 1.0  # lambda_sft
+    mode: str = "reuse_unconditional"  # reuse_unconditional | separate_forward
+    demo_only: bool = True  # (separate_forward) restrict anchor to is_demo samples
+
+
+@dataclasses.dataclass(frozen=True)
+class CFGConfig:
+    """Classifier-free guidance (advantage-conditioned prompt) settings."""
+
+    enabled: bool = False  # False => pure AWR+SFT (no guidance tokenization)
+    positive_only_conditional: bool = True
+    uncond_prob: float = 0.1
+
+
+@dataclasses.dataclass(frozen=True)
+class OfflineRLConfig:
+    """PT4FM offline-RL knobs for scripts/train_offline_rl.py (config-gated; all
+    defaults off => the run reduces to plain SFT / RECAP)."""
+
+    # Reads meta/advantages_{tag}.parquet (PT4FM stage-3 output: advantage +
+    # advantage_weight + is_demo). None => meta/advantages.parquet.
+    advantage_tag: str | None = None
+    awr: AWRConfig = dataclasses.field(default_factory=AWRConfig)
+    sft_aux: SFTAuxConfig = dataclasses.field(default_factory=SFTAuxConfig)
+    cfg: CFGConfig = dataclasses.field(default_factory=CFGConfig)
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -538,6 +633,10 @@ class TrainConfig:
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
+
+    # Optional PT4FM offline-RL settings, consumed only by scripts/train_offline_rl.py.
+    # None => standard SFT training (scripts/train.py is unaffected).
+    offline_rl: OfflineRLConfig | None = None
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
@@ -828,6 +927,69 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    #
+    # Pine "foundry" Industrial_Arm (3-camera) — disk/GPU/CPU/RAM insertion tasks.
+    # repo_id points at the merged RL-ready dataset; override per-dataset via the
+    # compute_norm_stats_fast.py --repo-id flag.
+    #
+    TrainConfig(
+        name="pine_foundry",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotPineFoundryDataConfig(
+            repo_id="/home/wenkai/hdd_projects/lerobot_618-624_merged",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=["action"],
+            ),
+            extra_delta_transform=True,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    #
+    # PT4FM offline-RL on pine_foundry, resuming the finetuned JAX pi0.5 (foundry_policy/50000).
+    # Run with: uv run scripts/train_offline_rl.py pine_foundry_rl --exp-name <name>
+    # Requires meta/advantages_{advantage_tag}.parquet (PT4FM stages 1-3, PyTorch) on the data.
+    #
+    TrainConfig(
+        name="pine_foundry_rl",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotPineFoundryDataConfig(
+            repo_id="/home/wenkai/hdd_projects/lerobot_618-624_merged",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=["action"],
+            ),
+            extra_delta_transform=True,
+        ),
+        offline_rl=OfflineRLConfig(
+            advantage_tag=None,  # set to your stage-3 tag, e.g. "v1_N10_q30"
+            awr=AWRConfig(enabled=True, beta=0.7, w_max=20.0),
+            sft_aux=SFTAuxConfig(weight=1.0, mode="reuse_unconditional", demo_only=True),
+            cfg=CFGConfig(enabled=False, positive_only_conditional=True, uncond_prob=0.1),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000, peak_lr=1e-5, decay_steps=100_000, decay_lr=1e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        # Resume from the finetuned JAX pi0.5 checkpoint (no JAX->PyTorch conversion needed).
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/wenkai/hdd_projects/models/foundry_policy/50000/params"
+        ),
         num_train_steps=30_000,
     ),
     #
